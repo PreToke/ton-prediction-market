@@ -1,0 +1,56 @@
+[package]
+name = "ton-prediction-market"
+description = "Prediction market protocol on TON using Conditional Tokens Framework with LMSR AMM"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[toolchain]
+acton = "1.1.0"
+
+[contracts.ConditionRegistry]
+display-name = "Condition Registry"
+src = "contracts/src/condition_registry.tolk"
+depends = []
+
+[contracts.LmsrMarketMaker]
+display-name = "LMSR Market Maker"
+src = "contracts/src/lmsr_market_maker.tolk"
+depends = []
+
+[contracts.JettonMinter]
+display-name = "Test USDT Minter"
+src = "contracts/src/jetton/JettonMinter.tolk"
+depends = ["JettonWallet"]
+
+[contracts.JettonWallet]
+display-name = "Test USDT Wallet"
+src = "contracts/src/jetton/JettonWallet.tolk"
+depends = []
+
+[test]
+
+[fmt]
+width = 100
+ignore = []
+
+[scripts]
+deploy-emulation = "acton script contracts/scripts/deploy.tolk"
+deploy-testnet = "acton script contracts/scripts/deploy.tolk --net testnet"
+jetton-deploy = "acton script contracts/scripts/jetton/deploy-test-usdt.tolk"
+jetton-deploy-testnet = "acton script contracts/scripts/jetton/deploy-test-usdt.tolk --net testnet"
+jetton-mint = "acton script contracts/scripts/jetton/mint.tolk"
+jetton-mint-testnet = "acton script contracts/scripts/jetton/mint.tolk --net testnet"
+jetton-setup = "acton script contracts/scripts/jetton/deploy-and-mint.tolk"
+jetton-setup-testnet = "acton script contracts/scripts/jetton/deploy-and-mint.tolk --net testnet"
+jetton-wallets = "acton script contracts/scripts/jetton/get-wallet-addresses.tolk --net testnet"
+
+[import-mappings]
+acton = ".acton"
+contracts = "contracts/src"
+jetton = "contracts/src/jetton"
+gen = "gen"
+tests = "contracts/tests"
+wrappers = "contracts/wrappers"
+
+# Check full Acton.toml reference and all available keys:
+# https://ton-blockchain.github.io/acton/docs/acton-toml
