@@ -80,6 +80,9 @@ fun fixed_pow2(x: int): int {
     val intPart = absX >> 64;
     val fracPart = absX & ((1 << 64) - 1);
 
+    // L-04: Guard against overflow — intPart must be < 256 to prevent extreme left shift
+    assert(intPart < 256) throw 403;
+
     // Taylor series coefficients for 2^f (c_k = ln(2)^k / k! in Q64.64)
     val c1 = 12786308645202655660;  // ln(2)
     val c2 = 4431396893595737425;   // ln(2)^2 / 2!

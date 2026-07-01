@@ -92,7 +92,7 @@ describe('Condition Preparation', () => {
 
     // Deploy ConditionRegistry with initial storage
     const contract = ConditionRegistry.fromStorage(
-      { owner: deployer.address, jettonWallet: deployer.address },
+      { owner: deployer.address, jettonWallet: deployer.address, collateralToken: deployer.address },
       contractCode,
     );
 

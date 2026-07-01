@@ -177,7 +177,7 @@ describe('Integration: Full Lifecycle', () => {
 
     // Deploy Condition Registry
     const registryContract = ConditionRegistry.fromStorage(
-      { owner: deployer.address, jettonWallet: registryJettonWallet },
+      { owner: deployer.address, jettonWallet: registryJettonWallet, collateralToken: jettonMaster.address },
       registryCode,
     );
     registry = blockchain.openContract(registryContract);

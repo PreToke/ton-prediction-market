@@ -3,6 +3,7 @@
 /// for the TON Prediction Market protocol.
 
 import "types"
+import "jetton/messages"
 
 // ─── Op-codes ───────────────────────────────────────────────────────────────
 
@@ -12,6 +13,12 @@ const OP_SPLIT_POSITION: int = 0x03;
 const OP_MERGE_POSITIONS: int = 0x04;
 const OP_REDEEM_POSITIONS: int = 0x05;
 const OP_TRANSFER_NOTIFICATION: int = 0x7362d09c;
+const OP_CLAIM_UNCLAIMED: int = 0x07;
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+/// Maximum allowed outcome slot count to prevent gas exhaustion in redeem loops
+const MAX_OUTCOME_SLOTS: int = 64;
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 
@@ -29,6 +36,8 @@ enum RegistryErrors {
     ConditionNotResolved = 208
     InvalidIndexSet = 209
     InsufficientGas = 210
+    ZeroPayout = 211
+    InvalidCollateralToken = 212
 }
 
 // ─── Storage ────────────────────────────────────────────────────────────────
@@ -36,8 +45,10 @@ enum RegistryErrors {
 struct RegistryStorage {
     owner: address
     jettonWallet: address
-    conditions: map<uint256, cell>      // condition_id → condition data cell
-    balances: map<uint256, coins>       // balance_key (hash of positionId+user) → amount
+    collateralToken: address                // expected collateral Jetton master address
+    conditions: map<uint256, cell>          // condition_id → condition data cell
+    balances: map<uint256, coins>           // balance_key (hash of positionId+user) → amount
+    pendingOps: map<uint64, cell>           // queryId → pending operation restoration data
 }
 
 fun RegistryStorage.load(): RegistryStorage {
@@ -83,6 +94,10 @@ struct (0x05) RedeemPositions {
     indexSets: cell
 }
 
+struct (0x07) ClaimUnclaimed {
+    queryId: uint64
+}
+
 // ─── Contract definition ────────────────────────────────────────────────────
 
 contract ConditionRegistry {
@@ -93,7 +108,7 @@ contract ConditionRegistry {
     incomingMessages: AllowedRegistryMessage
 }
 
-type AllowedRegistryMessage = PrepareCondition | ReportPayouts | MergePositions | RedeemPositions
+type AllowedRegistryMessage = PrepareCondition | ReportPayouts | MergePositions | RedeemPositions | ClaimUnclaimed
 
 // ─── ID Derivation ──────────────────────────────────────────────────────────
 
@@ -133,11 +148,13 @@ fun onInternalMessage(in: InMessage) {
 
     match (msg) {
         PrepareCondition => {
-            // Validate outcome slot count (must be >= 2)
-            assert(msg.outcomeSlotCount >= 2) throw RegistryErrors.InvalidOutcomeCount;
-
-            // Load storage
+            // H-01: Only owner can create conditions
             var storage = RegistryStorage.load();
+            assert(in.senderAddress == storage.owner) throw RegistryErrors.NotOwner;
+
+            // Validate outcome slot count (must be >= 2 and <= MAX_OUTCOME_SLOTS)
+            assert(msg.outcomeSlotCount >= 2) throw RegistryErrors.InvalidOutcomeCount;
+            assert(msg.outcomeSlotCount <= MAX_OUTCOME_SLOTS) throw RegistryErrors.InvalidOutcomeCount;
 
             // Compute condition_id from oracle, questionId, outcomeSlotCount
             val oracleSlice = beginCell().storeAddress(msg.oracle).endCell().beginParse();
@@ -221,6 +238,9 @@ fun onInternalMessage(in: InMessage) {
             // Load storage
             var storage = RegistryStorage.load();
 
+            // C-02 (second audit): Validate collateralToken matches expected
+            assert(msg.collateralToken == storage.collateralToken) throw RegistryErrors.InvalidCollateralToken;
+
             // Look up the condition — throw 202 if not found
             val lookupResult = storage.conditions.get(msg.conditionId);
             assert(lookupResult.isFound) throw RegistryErrors.ConditionNotFound;
@@ -231,12 +251,15 @@ fun onInternalMessage(in: InMessage) {
             cs.loadUint(256); // skip questionId
             val outcomeSlotCount = cs.loadUint(8);
 
-            // Execute merge logic
-            handleMerge(storage, in.senderAddress, msg.amount, msg.collateralToken, msg.parentCollectionId, msg.conditionId, outcomeSlotCount, msg.partitionCount, msg.partition);
+            // Execute merge logic (H-06: sender is authenticated via in.senderAddress)
+            handleMerge(storage, in.senderAddress, msg.amount, msg.collateralToken, msg.parentCollectionId, msg.conditionId, outcomeSlotCount, msg.partitionCount, msg.partition, msg.queryId);
         }
         RedeemPositions => {
             // Load storage
             var storage = RegistryStorage.load();
+
+            // M-06 (second audit): Validate collateralToken matches expected
+            assert(msg.collateralToken == storage.collateralToken) throw RegistryErrors.InvalidCollateralToken;
 
             // Look up the condition
             val lookupResult = storage.conditions.get(msg.conditionId);
@@ -304,11 +327,51 @@ fun onInternalMessage(in: InMessage) {
                 val parentPositionId = getPositionId(msg.collateralToken, msg.parentCollectionId);
                 val parentBalance = getBalance(storage, parentPositionId, sender);
                 storage = setBalance(storage, parentPositionId, sender, parentBalance + totalPayout);
+            } else if (totalPayout > 0 && msg.parentCollectionId == 0) {
+                // C-02: parentCollectionId == 0 — send collateral back to trader via Jetton transfer
+                // Store pending op for bounce recovery: record amount and recipient
+                val pendingData = beginCell()
+                    .storeAddress(sender)
+                    .storeCoins(totalPayout)
+                    .storeUint(1, 8)  // op type: 1 = redeem refund
+                    .endCell();
+                storage.pendingOps.set(msg.queryId, pendingData);
+
+                sendJettonTransfer(storage.jettonWallet, sender, totalPayout, msg.queryId);
             }
-            // If parentCollectionId == 0 and totalPayout > 0, need to send Jetton transfer
-            // (actual Jetton transfer deferred to task 12 — for now just update storage)
+            // If totalPayout == 0: positions are burned (losing positions), no transfer needed
 
             // Save updated storage
+            storage.save();
+        }
+        ClaimUnclaimed => {
+            // Allow users to re-claim collateral that was credited back after a bounced transfer.
+            var storage = RegistryStorage.load();
+            val sender = in.senderAddress;
+
+            // Look up unclaimed balance using positionId = 0 as sentinel
+            val unclaimedKey = getBalanceKey(0, sender);
+            val result = storage.balances.get(unclaimedKey);
+            var unclaimedBalance: int = 0;
+            if (result.isFound) {
+                unclaimedBalance = result.loadValue();
+            }
+            assert(unclaimedBalance > 0) throw RegistryErrors.InsufficientBalance;
+
+            // Zero out the unclaimed balance
+            storage.balances.set(unclaimedKey, 0);
+
+            // Store pending op for this claim (in case this transfer also bounces)
+            val pendingData = beginCell()
+                .storeAddress(sender)
+                .storeCoins(unclaimedBalance)
+                .storeUint(3, 8)  // op type: 3 = claim retry
+                .endCell();
+            storage.pendingOps.set(msg.queryId, pendingData);
+
+            // Send the collateral
+            sendJettonTransfer(storage.jettonWallet, sender, unclaimedBalance, msg.queryId);
+
             storage.save();
         }
         else => {
@@ -336,6 +399,9 @@ fun onInternalMessage(in: InMessage) {
                 val conditionId = fpSlice.loadUint(256);
                 val partitionCount = fpSlice.loadUint(8);
                 val partitionCell = fpSlice.loadRef();
+
+                // L-02: Validate collateralToken matches expected collateral in storage
+                assert(collateralToken == storage.collateralToken) throw RegistryErrors.InvalidCollateralToken;
 
                 // Look up the condition
                 val lookupResult = storage.conditions.get(conditionId);
@@ -462,6 +528,7 @@ fun handleMerge(
     outcomeSlotCount: int,
     partitionCount: int,
     partitionCell: cell,
+    queryId: int,
 ) {
     // Validate partition: must have at least 2 index sets
     assert(partitionCount >= 2) throw RegistryErrors.InvalidPartition;
@@ -508,9 +575,16 @@ fun handleMerge(
 
     if (isFullSetMerge) {
         if (parentCollectionId == 0) {
-            // Full-set merge with null parent: collateral refund
-            // For now, just update balances (actual Jetton transfer will be done in task 12)
-            // The collateral is released — no position to mint
+            // C-02: Full-set merge with null parent — collateral refund via Jetton transfer
+            // Store pending op for bounce recovery
+            val pendingData = beginCell()
+                .storeAddress(sender)
+                .storeCoins(amount)
+                .storeUint(2, 8)  // op type: 2 = merge refund
+                .endCell();
+            storage.pendingOps.set(queryId as uint64, pendingData);
+
+            sendJettonTransfer(storage.jettonWallet, sender, amount, queryId);
         } else {
             // Deep merge: full-set merge with non-null parent — mint the parent position
             val parentPositionId = getPositionId(collateralToken, parentCollectionId);
@@ -564,27 +638,78 @@ fun setBalance(storage: RegistryStorage, positionId: int, userAddress: address, 
     return storage;
 }
 
+// ─── Jetton Transfer Helper ─────────────────────────────────────────────────
+
+/// Send a Jetton transfer from this contract's Jetton wallet to a recipient.
+/// Used for collateral refunds (redeem with parentCollectionId == 0, full-set merge).
+fun sendJettonTransfer(jettonWallet: address, recipient: address, amount: int, queryId: int) {
+    val transferBody = beginCell()
+        .storeUint(0x0f8a7ea5, 32)  // AskToTransfer op
+        .storeUint(queryId, 64)
+        .storeCoins(amount)
+        .storeAddress(recipient)      // transferRecipient
+        .storeAddress(recipient)      // sendExcessesTo
+        .storeMaybeRef(null)          // customPayload
+        .storeCoins(0)                // forwardTonAmount
+        .storeUint(0, 1)              // forwardPayload (empty inline)
+        .endCell();
+
+    val transferMsg = createMessage({
+        bounce: true,
+        dest: jettonWallet,
+        value: 50000000,              // 0.05 TON for gas
+        body: transferBody,
+    });
+    transferMsg.send(SEND_MODE_PAY_FEES_SEPARATELY);
+}
+
 fun onBouncedMessage(in: InMessageBounced) {
-    // Parse bounced body - the prefix is already stripped by the framework
+    // Pending-operations bounce recovery for Jetton transfers.
+    // When a Jetton transfer bounces, we look up the pending op by queryId
+    // and credit the amount back to the recipient (the original sender).
     in.bouncedBody.skipBouncedPrefix();
     var body = in.bouncedBody;
 
-    // Read the original op-code from the bounced message
     if (body.remainingBitsCount() >= 32) {
         val bounceOp = body.loadUint(32);
 
         if (bounceOp == 0x0f8a7ea5) {
-            // Jetton transfer bounced - accept silently
-            // Parse query_id and amount if enough bits remain
+            // Jetton transfer (AskToTransfer) bounced
             if (body.remainingBitsCount() >= 64 + 4) {
-                val _queryId = body.loadUint(64);
-                val _amount = body.loadCoins();
+                val queryId = body.loadUint(64);
+                val bouncedAmount = body.loadCoins();
+
+                // Look up pending operation
+                var storage = RegistryStorage.load();
+                val pendingResult = storage.pendingOps.get(queryId as uint64);
+
+                if (pendingResult.isFound) {
+                    // Restore: credit the bounced amount back as a claimable balance
+                    // The pending data stores: recipient (address), amount (coins), opType (uint8)
+                    var pendingSlice = pendingResult.loadValue().beginParse();
+                    val recipient = pendingSlice.loadAddress();
+                    val pendingAmount = pendingSlice.loadCoins();
+                    val _opType = pendingSlice.loadUint(8);
+
+                    // Credit the amount to a special "unclaimed collateral" balance for the user.
+                    // We use positionId = 0 as a sentinel for unclaimed collateral refunds.
+                    val unclaimedKey = getBalanceKey(0, recipient);
+                    val currentUnclaimed = storage.balances.get(unclaimedKey);
+                    var unclaimedBalance: int = 0;
+                    if (currentUnclaimed.isFound) {
+                        unclaimedBalance = currentUnclaimed.loadValue();
+                    }
+                    storage.balances.set(unclaimedKey, unclaimedBalance + pendingAmount);
+
+                    // Remove the pending operation
+                    storage.pendingOps.delete(queryId as uint64);
+
+                    // Save
+                    storage.save();
+                }
             }
-            // State restoration would require tracking pending transfers
-            // For now, accept the bounce silently
         }
     }
-    // Default: silently accept other bounces
 }
 
 // ─── Get-methods ────────────────────────────────────────────────────────────
@@ -616,4 +741,14 @@ get fun compute_collection_id(parentCollectionId: int, conditionId: int, indexSe
 
 get fun compute_position_id(collateralToken: slice, collectionId: int): int {
     return get_position_id(collateralToken, collectionId);
+}
+
+get fun get_unclaimed_balance(userAddress: address): int {
+    val storage = RegistryStorage.load();
+    val key = getBalanceKey(0, userAddress);
+    val result = storage.balances.get(key);
+    if (!result.isFound) {
+        return 0;
+    }
+    return result.loadValue();
 }

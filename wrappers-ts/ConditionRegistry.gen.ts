@@ -37,6 +37,8 @@ export const RegistryErrors = {
   ConditionNotResolved: 208,
   InvalidIndexSet: 209,
   InsufficientGas: 210,
+  ZeroPayout: 211,
+  InvalidCollateralToken: 212,
 } as const;
 
 // ————————————————————————————————————————————
@@ -46,12 +48,14 @@ export const RegistryErrors = {
 export interface RegistryStorage {
   owner: c.Address;
   jettonWallet: c.Address;
+  collateralToken: c.Address;
 }
 
 export function registryStorageToCell(storage: RegistryStorage): c.Cell {
   return beginCell()
     .storeAddress(storage.owner)
     .storeAddress(storage.jettonWallet)
+    .storeAddress(storage.collateralToken)
     .storeDict(null) // conditions
     .storeDict(null) // balances
     .endCell();

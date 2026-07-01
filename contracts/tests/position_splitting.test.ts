@@ -158,7 +158,7 @@ describe('Position Splitting', () => {
 
     // Deploy ConditionRegistry with jettonWallet set to our mock wallet address
     const contract = ConditionRegistry.fromStorage(
-      { owner: deployer.address, jettonWallet: registryJettonWallet },
+      { owner: deployer.address, jettonWallet: registryJettonWallet, collateralToken: jettonMaster.address },
       contractCode,
     );
 

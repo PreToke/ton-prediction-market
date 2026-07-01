@@ -191,7 +191,7 @@ describe('Gas Validation - Condition Registry', () => {
     contractCode = loadRegistryCode();
 
     const contract = ConditionRegistry.fromStorage(
-      { owner: deployer.address, jettonWallet: deployer.address },
+      { owner: deployer.address, jettonWallet: deployer.address, collateralToken: deployer.address },
       contractCode,
     );
 
@@ -466,7 +466,7 @@ describe('Bounce Recovery - Condition Registry', () => {
     contractCode = loadRegistryCode();
 
     const contract = ConditionRegistry.fromStorage(
-      { owner: deployer.address, jettonWallet: jettonWallet.address },
+      { owner: deployer.address, jettonWallet: jettonWallet.address, collateralToken: jettonWallet.address },
       contractCode,
     );
 

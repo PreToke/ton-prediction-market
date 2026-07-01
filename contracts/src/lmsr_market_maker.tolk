@@ -4,6 +4,7 @@
 
 import "types"
 import "fixed_math"
+import "jetton/messages"
 
 // ─── Op-codes ───────────────────────────────────────────────────────────────
 
@@ -22,6 +23,9 @@ const OP_MM_TRANSFER_NOTIFICATION: int = 0x7362d09c;
 
 /// Fee range denominator: 10^18
 const FEE_RANGE: int = 1000000000000000000;
+
+/// Maximum allowed atomic outcome slot count to prevent gas exhaustion (M-04)
+const MAX_ATOMIC_OUTCOMES: int = 64;
 
 /// Market stages
 const STAGE_RUNNING: int = 0;
@@ -43,6 +47,10 @@ enum MarketErrors {
     InsufficientCollateral = 308
     ZeroFundingChange = 309
     InsufficientGas = 310
+    InvalidFee = 311
+    MaxOutcomesExceeded = 312
+    InvalidConditionCount = 313
+    InvalidOutcomeSlotCount = 314
 }
 
 // ─── Storage ────────────────────────────────────────────────────────────────
@@ -61,6 +69,7 @@ struct MarketState {
     positionBalances: map<uint32, int128>   // atomic_index → balance (can be negative for sells)
     positionIds: map<uint32, uint256>       // atomic_index → position_id cache
     accumulatedFees: uint128
+    pendingOps: map<uint64, cell>           // queryId → pending operation restoration data
 }
 
 struct MarketStorage {
@@ -165,6 +174,8 @@ fun onInternalMessage(in: InMessage) {
             var storage = MarketStorage.load();
             assert(in.senderAddress == storage.owner) throw MarketErrors.NotOwner;
             assert(storage.stage != STAGE_CLOSED) throw MarketErrors.MarketClosed;
+            // H-02: Validate fee does not exceed 100% (FEE_RANGE)
+            assert(msg.newFee as int <= FEE_RANGE) throw MarketErrors.InvalidFee;
             storage.fee = msg.newFee;
             storage.save();
         }
@@ -174,7 +185,10 @@ fun onInternalMessage(in: InMessage) {
             assert(in.senderAddress == storage.owner) throw MarketErrors.NotOwner;
             assert(storage.stage == STAGE_PAUSED) throw MarketErrors.MarketNotPaused;
             assert(msg.fundingChange != 0) throw MarketErrors.ZeroFundingChange;
-            storage.funding = ((storage.funding as int) + (msg.fundingChange as int)) as uint128;
+            // H-03: Validate that new funding remains positive (prevents division by zero)
+            val newFunding = (storage.funding as int) + (msg.fundingChange as int);
+            assert(newFunding > 0) throw MarketErrors.ZeroFunding;
+            storage.funding = newFunding as uint128;
             storage.save();
         }
         WithdrawFees => {
@@ -183,6 +197,19 @@ fun onInternalMessage(in: InMessage) {
             assert(in.senderAddress == storage.owner) throw MarketErrors.NotOwner;
             assert(storage.stage != STAGE_CLOSED) throw MarketErrors.MarketClosed;
             var state = storage.state.load();
+            val feesToWithdraw = state.accumulatedFees as int;
+            // H-05: Send accumulated fees to owner via Jetton transfer before zeroing
+            if (feesToWithdraw > 0) {
+                val config = storage.config.load();
+                // Store pending op for bounce recovery
+                val pendingData = beginCell()
+                    .storeAddress(storage.owner)
+                    .storeCoins(feesToWithdraw)
+                    .storeUint(1, 8)  // op type: 1 = fee withdrawal
+                    .endCell();
+                state.pendingOps.set(msg.queryId, pendingData);
+                sendMarketJettonTransfer(config.jettonWallet, storage.owner, feesToWithdraw, msg.queryId);
+            }
             state.accumulatedFees = 0 as uint128;
             storage.state = state.toCell();
             storage.save();
@@ -196,7 +223,7 @@ fun onInternalMessage(in: InMessage) {
 
             // Access sell trade fields from smart-casted msg
             val tradeAmountsCell = msg.outcomeTokenAmounts;
-            val _minCollateralReturn = msg.minCollateralReturn;
+            val minCollateralReturn = msg.minCollateralReturn;
 
             // Validate outcomeTokenAmounts length == atomicOutcomeSlotCount
             val outcomeCount = storage.atomicOutcomeSlotCount as int;
@@ -207,6 +234,9 @@ fun onInternalMessage(in: InMessage) {
                 validateLen += 1;
             }
             assert(validateLen == outcomeCount) throw MarketErrors.InvalidTradeAmounts;
+            // M-06: Strict validation — no extra bits or refs allowed
+            assert(validateSlice.remainingBitsCount() == 0) throw MarketErrors.InvalidTradeAmounts;
+            assert(validateSlice.remainingRefsCount() == 0) throw MarketErrors.InvalidTradeAmounts;
 
             // Load current state
             var state = storage.state.load();
@@ -220,6 +250,15 @@ fun onInternalMessage(in: InMessage) {
                 absNetCost = -absNetCost;
             }
             val fee = absNetCost * (storage.fee as int) / FEE_RANGE;
+
+            // C-03: For sells, the trader receives abs(netCost) - fee as collateral.
+            // Whether amounts are positive (pool gains) or negative (pool loses),
+            // the absolute cost difference represents the trade value.
+            val collateralReturn = absNetCost - fee;
+            // Only check minimum return if the trader specified a non-zero minimum
+            if (minCollateralReturn > 0) {
+                assert(collateralReturn >= minCollateralReturn as int) throw MarketErrors.InsufficientCollateral;
+            }
 
             // Update position balances: for each i, positionBalances[i] += tradeAmounts[i]
             var tradeSlice = tradeAmountsCell.beginParse();
@@ -238,6 +277,12 @@ fun onInternalMessage(in: InMessage) {
             // Save updated state
             storage.state = state.toCell();
             storage.save();
+
+            // C-03: Send collateral back to seller via Jetton transfer
+            if (collateralReturn > 0) {
+                val config = storage.config.load();
+                sendMarketJettonTransfer(config.jettonWallet, in.senderAddress, collateralReturn, msg.queryId);
+            }
         }
         else => {
             // Handle transfer_notification for init_market and buy trades (op 0x7362d09c)
@@ -245,9 +290,9 @@ fun onInternalMessage(in: InMessage) {
             val op = bodySlice.loadUint(32);
 
             if (op == OP_MM_TRANSFER_NOTIFICATION) {
-                val _queryId = bodySlice.loadUint(64);
+                val queryId = bodySlice.loadUint(64);
                 val amount = bodySlice.loadCoins();
-                val _sender = bodySlice.loadAddress();
+                val sender = bodySlice.loadAddress();
                 val forwardPayload = bodySlice.loadRef();
 
                 // Load storage and verify message comes from our Jetton wallet
@@ -264,12 +309,19 @@ fun onInternalMessage(in: InMessage) {
                     // Check stage == 255 (uninitialized)
                     assert(storage.stage == 255) throw MarketErrors.MarketAlreadyInitialized;
 
+                    // L-05: Validate sender (initiator of the Jetton transfer) is the owner
+                    assert(sender == storage.owner) throw MarketErrors.NotOwner;
+
                     // Check amount > 0
                     assert(amount > 0) throw MarketErrors.ZeroFunding;
 
                     // Parse init_market payload
                     val conditionRegistry = fpSlice.loadAddress();
                     val conditionCount = fpSlice.loadUint(8);
+
+                    // M-02: Validate conditionCount > 0
+                    assert(conditionCount > 0) throw MarketErrors.InvalidConditionCount;
+
                     val conditionIdsCell = fpSlice.loadRef();
                     val outcomeSlotCountsCell = fpSlice.loadRef();
 
@@ -279,7 +331,11 @@ fun onInternalMessage(in: InMessage) {
                     var i: int = 0;
                     while (i < conditionCount) {
                         val slotCount = outcomeSlice.loadUint(8);
+                        // M-02: Validate each slotCount >= 2
+                        assert(slotCount >= 2) throw MarketErrors.InvalidOutcomeSlotCount;
                         atomicOutcomeSlotCount *= slotCount;
+                        // M-03: Check for overflow — cap at MAX_ATOMIC_OUTCOMES
+                        assert(atomicOutcomeSlotCount <= MAX_ATOMIC_OUTCOMES) throw MarketErrors.MaxOutcomesExceeded;
                         i += 1;
                     }
 
@@ -318,6 +374,9 @@ fun onInternalMessage(in: InMessage) {
                         validateLen += 1;
                     }
                     assert(validateLen == outcomeCount) throw MarketErrors.InvalidTradeAmounts;
+                    // M-06: Strict validation — no extra bits or refs allowed
+                    assert(validateSlice.remainingBitsCount() == 0) throw MarketErrors.InvalidTradeAmounts;
+                    assert(validateSlice.remainingRefsCount() == 0) throw MarketErrors.InvalidTradeAmounts;
 
                     // Load current state
                     var state = storage.state.load();
@@ -343,6 +402,9 @@ fun onInternalMessage(in: InMessage) {
                     // Check sufficient collateral
                     assert(amount as int >= totalCost) throw MarketErrors.InsufficientCollateral;
 
+                    // C-04: Compute refund for overpayment
+                    val refund = (amount as int) - totalCost;
+
                     // Update position balances: for each i, positionBalances[i] += tradeAmounts[i]
                     var tradeSlice = tradeAmountsCell.beginParse();
                     var idx = 0;
@@ -360,6 +422,11 @@ fun onInternalMessage(in: InMessage) {
                     // Save updated state
                     storage.state = state.toCell();
                     storage.save();
+
+                    // C-04: Refund excess collateral to sender
+                    if (refund > 0) {
+                        sendMarketJettonTransfer(config.jettonWallet, sender, refund, queryId);
+                    }
                 } else {
                     assert(false) throw MarketErrors.InvalidMessage;
                 }
@@ -371,26 +438,74 @@ fun onInternalMessage(in: InMessage) {
 }
 
 fun onBouncedMessage(in: InMessageBounced) {
-    // Parse bounced body - the prefix is already stripped by the framework
+    // Pending-operations bounce recovery for Jetton transfers.
+    // When a Jetton transfer bounces, we look up the pending op by queryId
+    // and restore the state (e.g., re-credit fees, mark refund as unclaimed).
     in.bouncedBody.skipBouncedPrefix();
     var body = in.bouncedBody;
 
-    // Read the original op-code from the bounced message
     if (body.remainingBitsCount() >= 32) {
         val bounceOp = body.loadUint(32);
 
         if (bounceOp == 0x0f8a7ea5) {
-            // Jetton transfer bounced - accept silently
-            // Parse query_id and amount if enough bits remain
+            // Jetton transfer (AskToTransfer) bounced
             if (body.remainingBitsCount() >= 64 + 4) {
-                val _queryId = body.loadUint(64);
-                val _amount = body.loadCoins();
+                val queryId = body.loadUint(64);
+                val _bouncedAmount = body.loadCoins();
+
+                // Look up pending operation
+                var storage = MarketStorage.load();
+                var state = storage.state.load();
+                val pendingResult = state.pendingOps.get(queryId as uint64);
+
+                if (pendingResult.isFound) {
+                    var pendingSlice = pendingResult.loadValue().beginParse();
+                    val _recipient = pendingSlice.loadAddress();
+                    val pendingAmount = pendingSlice.loadCoins();
+                    val opType = pendingSlice.loadUint(8);
+
+                    if (opType == 1) {
+                        // Fee withdrawal bounced — restore accumulated fees
+                        state.accumulatedFees = ((state.accumulatedFees as int) + pendingAmount) as uint128;
+                    }
+                    // For sell trade returns (opType 2) and buy refunds (opType 3),
+                    // the funds remain in the contract's Jetton wallet.
+                    // The owner can manually recover them via a direct Jetton transfer.
+
+                    // Remove the pending operation
+                    state.pendingOps.delete(queryId as uint64);
+
+                    storage.state = state.toCell();
+                    storage.save();
+                }
             }
-            // State restoration for the full trade flow would require
-            // storing pending trade info - for now, accept the bounce silently
         }
     }
-    // Default: silently accept other bounces
+}
+
+// ─── Jetton Transfer Helper ─────────────────────────────────────────────────
+
+/// Send a Jetton transfer from this contract's Jetton wallet to a recipient.
+/// Used for sell trade returns, buy trade refunds, and fee withdrawals.
+fun sendMarketJettonTransfer(jettonWallet: address, recipient: address, amount: int, queryId: int) {
+    val transferBody = beginCell()
+        .storeUint(0x0f8a7ea5, 32)  // AskToTransfer op
+        .storeUint(queryId, 64)
+        .storeCoins(amount)
+        .storeAddress(recipient)      // transferRecipient
+        .storeAddress(recipient)      // sendExcessesTo
+        .storeMaybeRef(null)          // customPayload
+        .storeCoins(0)                // forwardTonAmount
+        .storeUint(0, 1)              // forwardPayload (empty inline)
+        .endCell();
+
+    val transferMsg = createMessage({
+        bounce: true,
+        dest: jettonWallet,
+        value: 50000000,              // 0.05 TON for gas
+        body: transferBody,
+    });
+    transferMsg.send(SEND_MODE_PAY_FEES_SEPARATELY);
 }
 
 // ─── LMSR Cost Functions ────────────────────────────────────────────────────
@@ -488,9 +603,17 @@ fun calcNetCost(currentBalances: map<uint32, int128>, tradeAmounts: cell, atomic
     // Compute C(q_after) in Q64.64
     val costAfter = lmsrCost(afterBalances, atomicOutcomeSlotCount, funding);
 
-    // Net cost in Q64.64, convert to raw token units (floor division by ONE)
+    // Net cost in Q64.64, convert to raw token units
+    // M-01: Use ceiling division for positive costs (trader pays more, preventing free trades)
+    // and floor division for negative costs (trader receives less, preventing extraction)
     val netCostFixed = costAfter - costBefore;
-    return netCostFixed / ONE;
+    if (netCostFixed >= 0) {
+        // Ceiling division: (netCostFixed + ONE - 1) / ONE
+        return (netCostFixed + ONE - 1) / ONE;
+    } else {
+        // Floor division for negative values (towards more negative)
+        return netCostFixed / ONE;
+    }
 }
 
 // ─── Get-methods ────────────────────────────────────────────────────────────

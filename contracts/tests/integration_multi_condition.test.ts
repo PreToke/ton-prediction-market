@@ -184,7 +184,7 @@ describe('Integration: Multi-Condition Market (2 conditions, 4 atomic outcomes)'
 
     // Deploy Condition Registry
     const registryContract = ConditionRegistry.fromStorage(
-      { owner: deployer.address, jettonWallet: registryJettonWallet },
+      { owner: deployer.address, jettonWallet: registryJettonWallet, collateralToken: jettonMaster.address },
       registryCode,
     );
     registry = blockchain.openContract(registryContract);
